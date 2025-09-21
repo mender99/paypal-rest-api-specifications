@@ -1,0 +1,1603 @@
+package com.example.paypalpayment;
+
+import com.paypal.sdk.PaypalServerSdkClient;
+import com.paypal.sdk.authentication.ClientCredentialsAuthModel;
+import com.paypal.sdk.exceptions.ApiException;
+import com.paypal.sdk.http.response.ApiResponse;
+import com.paypal.sdk.models.CheckoutPaymentIntent;
+import com.paypal.sdk.models.OAuthToken;
+import com.paypal.sdk.models.Order;
+import com.paypal.sdk.models.OrderAuthorizeResponse;
+import com.paypal.sdk.models.CreateOrderInput;
+import com.paypal.sdk.models.OrderRequest;
+import com.paypal.sdk.models.PurchaseUnitRequest;
+import com.paypal.sdk.models.AmountWithBreakdown;
+import com.paypal.sdk.models.PaymentAuthorization;
+import com.paypal.sdk.models.CapturedPayment;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Bean;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+import org.springframework.web.bind.annotation.*;
+import javax.persistence.*;
+import javax.servlet.http.HttpSession;
+import java.io.IOException;
+import java.security.SecureRandom;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+
+@SpringBootApplication
+@EnableScheduling
+@RestController
+@RequestMapping("/paypal")
+public class PayPalPaymentApplication {
+
+    private static final Logger logger = LoggerFactory.getLogger(PayPalPaymentApplication.class);
+    private static final String SODIUM_KEY = System.getenv("SODIUM_KEY_HEX") != null
+            ? System.getenv("SODIUM_KEY_HEX")
+            : "your-secure-32-byte-hex-key-here"; // Store in env var
+    private static final byte[] SODIUM_KEY_BYTES = hexToBytes(SODIUM_KEY);
+
+    @Value("${paypal.live.client-id}")
+    private String liveClientId;
+    @Value("${paypal.live.client-secret}")
+    private String liveClientSecret;
+    @Value("${paypal.live.api-url}")
+    private String liveApiUrl;
+    @Value("${paypal.live.mcp-server-url}")
+    private String liveMcpServerUrl;
+    @Value("${paypal.live.webhook-id}")
+    private String liveWebhookId;
+    @Value("${paypal.sandbox.client-id}")
+    private String sandboxClientId;
+    @Value("${paypal.sandbox.client-secret}")
+    private String sandboxClientSecret;
+    @Value("${paypal.sandbox.api-url}")
+    private String sandboxApiUrl;
+    @Value("${paypal.sandbox.mcp-server-url}")
+    private String sandboxMcpServerUrl;
+    @Value("${paypal.sandbox.webhook-id}")
+    private String sandboxWebhookId;
+
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    @Autowired
+    private TransactionRepository transactionRepository;
+    @Autowired
+    private OAuthTokenRepository oAuthTokenRepository;
+    @Autowired
+    private javax.servlet.http.HttpServletRequest request;
+
+    private final PaypalServerSdkClient liveClient;
+    private final PaypalServerSdkClient sandboxClient;
+
+    public PayPalPaymentApplication() {
+        liveClient = new PaypalServerSdkClient.Builder()
+                .clientCredentialsAuth(new ClientCredentialsAuthModel.Builder(
+                        decrypt(liveClientId),
+                        decrypt(liveClientSecret))
+                        .oAuthTokenProvider((lastOAuthToken, credentialsManager) -> {
+                            OAuthToken oAuthToken = loadTokenFromDatabase("live");
+                            if (oAuthToken != null && !credentialsManager.isTokenExpired(oAuthToken)) {
+                                return oAuthToken;
+                            }
+                            OAuthToken newToken = credentialsManager.fetchToken();
+                            saveTokenToDatabase(newToken, "live");
+                            return newToken;
+                        })
+                        .oAuthOnTokenUpdate(oAuthToken -> saveTokenToDatabase(oAuthToken, "live"))
+                        .build())
+                .build();
+
+        sandboxClient = new PaypalServerSdkClient.Builder()
+                .clientCredentialsAuth(new ClientCredentialsAuthModel.Builder(
+                        decrypt(sandboxClientId),
+                        decrypt(sandboxClientSecret))
+                        .oAuthTokenProvider((lastOAuthToken, credentialsManager) -> {
+                            OAuthToken oAuthToken = loadTokenFromDatabase("sandbox");
+                            if (oAuthToken != null && !credentialsManager.isTokenExpired(oAuthToken)) {
+                                return oAuthToken;
+                            }
+                            OAuthToken newToken = credentialsManager.fetchToken();
+                            saveTokenToDatabase(newToken, "sandbox");
+                            return newToken;
+                        })
+                        .oAuthOnTokenUpdate(oAuthToken -> saveTokenToDatabase(oAuthToken, "sandbox"))
+                        .build())
+                .build();
+    }
+
+    // Custom input classes
+    public static class GetOrderInput {
+        private String orderId;
+        private String environment;
+
+        public GetOrderInput(String orderId, String environment) {
+            this.orderId = orderId;
+            this.environment = environment;
+        }
+
+        public String getOrderId() { return orderId; }
+        public String getEnvironment() { return environment; }
+    }
+
+    public static class AuthorizeOrderInput {
+        private String orderId;
+        private String environment;
+        private String prefer;
+
+        private AuthorizeOrderInput(Builder builder) {
+            this.orderId = builder.orderId;
+            this.environment = builder.environment;
+            this.prefer = builder.prefer;
+        }
+
+        public String getOrderId() { return orderId; }
+        public String getEnvironment() { return environment; }
+        public String getPrefer() { return prefer; }
+
+        public static class Builder {
+            private String orderId;
+            private String environment;
+            private String prefer;
+
+            public Builder(String orderId, String context) {
+                this.orderId = orderId;
+                this.environment = context != null ? context : "live";
+            }
+
+            public Builder prefer(String prefer) {
+                this.prefer = prefer;
+                return this;
+            }
+
+            public AuthorizeOrderInput build() {
+                return new AuthorizeOrderInput(this);
+            }
+        }
+    }
+
+    public static class GetAuthorizedPaymentInput {
+        private String authorizationId;
+        private String environment;
+
+        public GetAuthorizedPaymentInput(String authorizationId, String environment) {
+            this.authorizationId = authorizationId;
+            this.environment = environment;
+        }
+
+        public String getAuthorizationId() { return authorizationId; }
+        public String getEnvironment() { return environment; }
+    }
+
+    public static class CaptureAuthorizedPaymentInput {
+        private String authorizationId;
+        private String environment;
+        private Double amount;
+        private String currency;
+
+        public CaptureAuthorizedPaymentInput(String authorizationId, String environment, Double amount, String currency) {
+            this.authorizationId = authorizationId;
+            this.environment = environment;
+            this.amount = amount;
+            this.currency = currency;
+        }
+
+        public String getAuthorizationId() { return authorizationId; }
+        public String getEnvironment() { return environment; }
+        public Double getAmount() { return amount; }
+        public String getCurrency() { return currency; }
+    }
+
+    public static class PaymentInput {
+        private double amount;
+        private String currency;
+        private String returnUrl;
+        private String cancelUrl;
+        private String userRegion;
+        private boolean mcpAi;
+        private String ip;
+        private String userAgent;
+        private boolean authorize;
+
+        public PaymentInput(double amount, String currency, String returnUrl, String cancelUrl,
+                           String userRegion, boolean mcpAi, String ip, String userAgent, boolean authorize) {
+            this.amount = amount;
+            this.currency = currency;
+            this.returnUrl = returnUrl;
+            this.cancelUrl = cancelUrl;
+            this.userRegion = userRegion;
+            this.mcpAi = mcpAi;
+            this.ip = ip;
+            this.userAgent = userAgent;
+            this.authorize = authorize;
+        }
+
+        public double getAmount() { return amount; }
+        public String getCurrency() { return currency; }
+        public String getReturnUrl() { return returnUrl; }
+        public String getCancelUrl() { return cancelUrl; }
+        public String getUserRegion() { return userRegion; }
+        public boolean isMcpAi() { return mcpAi; }
+        public String getIp() { return ip; }
+        public String getUserAgent() { return userAgent; }
+        public boolean isAuthorize() { return authorize; }
+    }
+
+    // Entity for transactions
+    @Entity
+    public static class Transaction {
+        @Id
+        @GeneratedValue(strategy = GenerationType.IDENTITY)
+        private Long id;
+        private String orderId;
+        private String authorizationId;
+        private String captureId;
+        private double amount;
+        private String currency;
+        private String status;
+        private String environment;
+        private boolean scaVerified;
+        private Double fraudScore;
+        private String tokenizedPayment;
+        private Instant createdAt = Instant.now();
+
+        public Long getId() { return id; }
+        public void setId(Long id) { this.id = id; }
+        public String getOrderId() { return orderId; }
+        public void setOrderId(String orderId) { this.orderId = orderId; }
+        public String getAuthorizationId() { return authorizationId; }
+        public void setAuthorizationId(String authorizationId) { this.authorizationId = authorizationId; }
+        public String getCaptureId() { return captureId; }
+        public void setCaptureId(String captureId) { this.captureId = captureId; }
+        public double getAmount() { return amount; }
+        public void setAmount(double amount) { this.amount = amount; }
+        public String getCurrency() { return currency; }
+        public void setCurrency(String currency) { this.currency = currency; }
+        public String getStatus() { return status; }
+        public void setStatus(String status) { this.status = status; }
+        public String getEnvironment() { return environment; }
+        public void setEnvironment(String environment) { this.environment = environment; }
+        public boolean isScaVerified() { return scaVerified; }
+        public void setScaVerified(boolean scaVerified) { this.scaVerified = scaVerified; }
+        public Double getFraudScore() { return fraudScore; }
+        public void setFraudScore(Double fraudScore) { this.fraudScore = fraudScore; }
+        public String getTokenizedPayment() { return tokenizedPayment; }
+        public void setTokenizedPayment(String tokenizedPayment) { this.tokenizedPayment = tokenizedPayment; }
+        public Instant getCreatedAt() { return createdAt; }
+        public void setCreatedAt(Instant createdAt) { this.createdAt = createdAt; }
+    }
+
+    // Entity for OAuth tokens
+    @Entity
+    public static class OAuthTokenEntity {
+        @Id
+        @GeneratedValue(strategy = GenerationType.IDENTITY)
+        private Long id;
+        private String accessToken;
+        private String tokenType;
+        private String environment;
+        private long expiresIn;
+        private Instant createdAt = Instant.now();
+
+        public Long getId() { return id; }
+        public void setId(Long id) { this.id = id; }
+        public String getAccessToken() { return accessToken; }
+        public void setAccessToken(String accessToken) { this.accessToken = accessToken; }
+        public String getTokenType() { return tokenType; }
+        public void setTokenType(String tokenType) { this.tokenType = tokenType; }
+        public String getEnvironment() { return environment; }
+        public void setEnvironment(String environment) { this.environment = environment; }
+        public long getExpiresIn() { return expiresIn; }
+        public void setExpiresIn(long expiresIn) { this.expiresIn = expiresIn; }
+        public Instant getCreatedAt() { return createdAt; }
+        public void setCreatedAt(Instant createdAt) { this.createdAt = createdAt; }
+    }
+
+    // JPA Repository for transactions
+    public interface TransactionRepository extends JpaRepository<Transaction, Long> {
+        @Query("SELECT t.status, COUNT(t) FROM Transaction t GROUP BY t.status")
+        List<Object[]> countTransactionsByStatus();
+    }
+
+    // JPA Repository for OAuth tokens
+    public interface OAuthTokenRepository extends JpaRepository<OAuthTokenEntity, Long> {
+        List<OAuthTokenEntity> findByEnvironmentOrderByCreatedAtDesc(String environment);
+        void deleteByEnvironmentAndCreatedAtBefore(String environment, Instant cutoff);
+    }
+
+    // OrdersController to wrap SDK calls
+    @Component
+    public class OrdersController {
+        private final PaypalServerSdkClient client;
+
+        public OrdersController(PaypalServerSdkClient client) {
+            this.client = client;
+        }
+
+        public CompletableFuture<ApiResponse<Order>> createOrderAsync(CreateOrderInput input) {
+            return client.createOrderAsync(input);
+        }
+
+        public CompletableFuture<ApiResponse<Order>> getOrderAsync(GetOrderInput input) {
+            if (input.getOrderId() == null || input.getOrderId().isEmpty()) {
+                return CompletableFuture.failedFuture(new IllegalArgumentException("Order ID is required"));
+            }
+            return CompletableFuture.supplyAsync(() -> {
+                try {
+                    ApiResponse<Order> response = client.executeGet("/v2/checkout/orders/" + input.getOrderId());
+                    if (response.getStatusCode() >= 400) {
+                        logger.error("Order retrieval failed for order ID {}: HTTP {}", input.getOrderId(), response.getStatusCode());
+                        throw new IOException("Failed to retrieve order: HTTP " + response.getStatusCode());
+                    }
+                    logger.info("Retrieved order ID: {}", input.getOrderId());
+                    return response;
+                } catch (Exception e) {
+                    logger.error("Order retrieval failed for order ID {}: {}", input.getOrderId(), e.getMessage());
+                    throw new RuntimeException("Order retrieval failed", e);
+                }
+            });
+        }
+
+        public CompletableFuture<ApiResponse<OrderAuthorizeResponse>> authorizeOrderAsync(AuthorizeOrderInput input) {
+            if (input.getOrderId() == null || input.getOrderId().isEmpty()) {
+                return CompletableFuture.failedFuture(new IllegalArgumentException("Order ID is required"));
+            }
+            return CompletableFuture.supplyAsync(() -> {
+                try {
+                    Map<String, String> headers = input.getPrefer() != null
+                            ? Map.of("Prefer", input.getPrefer())
+                            : new HashMap<>();
+                    ApiResponse<OrderAuthorizeResponse> response = client.executePost(
+                            "/v2/checkout/orders/" + input.getOrderId() + "/authorize",
+                            new HashMap<>(),
+                            headers
+                    );
+                    if (response.getStatusCode() >= 400) {
+                        logger.error("Order authorization failed for order ID {}: HTTP {}", input.getOrderId(), response.getStatusCode());
+                        throw new IOException("Failed to authorize order: HTTP " + response.getStatusCode());
+                    }
+                    logger.info("Authorized order ID: {}", input.getOrderId());
+                    return response;
+                } catch (Exception e) {
+                    logger.error("Order authorization failed for order ID {}: {}", input.getOrderId(), e.getMessage());
+                    throw new RuntimeException("Order authorization failed", e);
+                }
+            });
+        }
+
+        public CompletableFuture<ApiResponse<PaymentAuthorization>> getAuthorizedPaymentAsync(GetAuthorizedPaymentInput input) {
+            if (input.getAuthorizationId() == null || input.getAuthorizationId().isEmpty()) {
+                return CompletableFuture.failedFuture(new IllegalArgumentException("Authorization ID is required"));
+            }
+            return CompletableFuture.supplyAsync(() -> {
+                try {
+                    ApiResponse<PaymentAuthorization> response = client.executeGet("/v2/payments/authorizations/" + input.getAuthorizationId());
+                    if (response.getStatusCode() >= 400) {
+                        logger.error("Authorization retrieval failed for authorization ID {}: HTTP {}", input.getAuthorizationId(), response.getStatusCode());
+                        throw new IOException("Failed to retrieve authorization: HTTP " + response.getStatusCode());
+                    }
+                    logger.info("Retrieved authorization ID: {}", input.getAuthorizationId());
+                    return response;
+                } catch (Exception e) {
+                    logger.error("Authorization retrieval failed for authorization ID {}: {}", input.getAuthorizationId(), e.getMessage());
+                    throw new RuntimeException("Authorization retrieval failed", e);
+                }
+            });
+        }
+
+        public CompletableFuture<ApiResponse<CapturedPayment>> captureAuthorizedPaymentAsync(CaptureAuthorizedPaymentInput input) {
+            if (input.getAuthorizationId() == null || input.getAuthorizationId().isEmpty()) {
+                return CompletableFuture.failedFuture(new IllegalArgumentException("Authorization ID is required"));
+            }
+            return CompletableFuture.supplyAsync(() -> {
+                try {
+                    Map<String, Object> requestBody = new HashMap<>();
+                    if (input.getAmount() != null && input.getCurrency() != null) {
+                        requestBody.put("amount", Map.of(
+                                "value", String.format("%.2f", input.getAmount()),
+                                "currency_code", input.getCurrency().toUpperCase()
+                        ));
+                    }
+                    ApiResponse<CapturedPayment> response = client.executePost(
+                            "/v2/payments/authorizations/" + input.getAuthorizationId() + "/capture",
+                            requestBody
+                    );
+                    if (response.getStatusCode() >= 400) {
+                        logger.error("Capture failed for authorization ID {}: HTTP {}", input.getAuthorizationId(), response.getStatusCode());
+                        throw new IOException("Failed to capture authorization: HTTP " + response.getStatusCode());
+                    }
+                    logger.info("Captured authorization ID: {}", input.getAuthorizationId());
+                    return response;
+                } catch (Exception e) {
+                    logger.error("Capture failed for authorization ID {}: {}", input.getAuthorizationId(), e.getMessage());
+                    throw new RuntimeException("Capture failed", e);
+                }
+            });
+        }
+    }
+
+    // Load OAuth token from database
+    private OAuthToken loadTokenFromDatabase(String environment) {
+        try {
+            List<OAuthTokenEntity> tokens = oAuthTokenRepository.findByEnvironmentOrderByCreatedAtDesc(environment);
+            if (tokens.isEmpty()) {
+                logger.info("No OAuth token found in database for environment: {}", environment);
+                return null;
+            }
+            OAuthTokenEntity tokenEntity = tokens.get(0);
+            OAuthToken oAuthToken = new OAuthToken();
+            oAuthToken.setAccessToken(decrypt(tokenEntity.getAccessToken()));
+            oAuthToken.setTokenType(tokenEntity.getTokenType());
+            oAuthToken.setExpiresIn(tokenEntity.getExpiresIn());
+            logger.info("Loaded OAuth token for environment: {}", environment);
+            return oAuthToken;
+        } catch (Exception e) {
+            logger.error("Failed to load OAuth token for environment {}: {}", environment, e.getMessage());
+            sendAlert("Failed to load OAuth token: " + e.getMessage(), "Error");
+            return null;
+        }
+    }
+
+    // Save OAuth token to database
+    private void saveTokenToDatabase(OAuthToken oAuthToken, String environment) {
+        try {
+            OAuthTokenEntity tokenEntity = new OAuthTokenEntity();
+            tokenEntity.setAccessToken(encrypt(oAuthToken.getAccessToken()));
+            tokenEntity.setTokenType(oAuthToken.getTokenType());
+            tokenEntity.setEnvironment(environment);
+            tokenEntity.setExpiresIn(oAuthToken.getExpiresIn());
+            oAuthTokenRepository.save(tokenEntity);
+            logger.info("Saved OAuth token for environment: {}", environment);
+        } catch (Exception e) {
+            logger.error("Failed to save OAuth token for environment {}: {}", environment, e.getMessage());
+            sendAlert("Failed to save OAuth token: " + e.getMessage(), "Error");
+        }
+    }
+
+    // Clean up expired tokens
+    @Scheduled(fixedRate = 24 * 60 * 60 * 1000)
+    public void cleanExpiredTokens() {
+        try {
+            Instant cutoff = Instant.now().minusSeconds(24 * 3600);
+            oAuthTokenRepository.deleteByEnvironmentAndCreatedAtBefore("live", cutoff);
+            oAuthTokenRepository.deleteByEnvironmentAndCreatedAtBefore("sandbox", cutoff);
+            logger.info("Cleaned up expired OAuth tokens");
+        } catch (Exception e) {
+            logger.error("Failed to clean expired OAuth tokens: {}", e.getMessage());
+            sendAlert("Failed to clean expired OAuth tokens: " + e.getMessage(), "Error");
+        }
+    }
+
+    // Sodium encryption/decryption
+    private static byte[] hexToBytes(String hex) {
+        int len = hex.length();
+        byte[] data = new byte[len / 2];
+        for (int i = 0; i < len; i += 2) {
+            data[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4) + Character.digit(hex.charAt(i + 1), 16));
+        }
+        return data;
+    }
+
+    private static String encrypt(String data) {
+        try {
+            byte[] nonce = new byte[24];
+            new SecureRandom().nextBytes(nonce);
+            byte[] encrypted = sodium.crypto_secretbox_easy(data.getBytes(), nonce, SODIUM_KEY_BYTES);
+            byte[] result = new byte[nonce.length + encrypted.length];
+            System.arraycopy(nonce, 0, result, 0, nonce.length);
+            System.arraycopy(encrypted, 0, result, nonce.length, encrypted.length);
+            return Base64.getEncoder().encodeToString(result);
+        } catch (Exception e) {
+            logger.error("Encryption failed: {}", e.getMessage());
+            throw new RuntimeException("Encryption failed");
+        }
+    }
+
+    private static String decrypt(String data) {
+        try {
+            byte[] decoded = Base64.getDecoder().decode(data);
+            byte[] nonce = Arrays.copyOfRange(decoded, 0, 24);
+            byte[] ciphertext = Arrays.copyOfRange(decoded, 24, decoded.length);
+            byte[] decrypted = sodium.crypto_secretbox_open_easy(ciphertext, nonce, SODIUM_KEY_BYTES);
+            return new String(decrypted);
+        } catch (Exception e) {
+            logger.error("Decryption failed: {}", e.getMessage());
+            throw new RuntimeException("Decryption failed");
+        }
+    }
+
+    // CSRF token
+    private String generateCsrfToken(HttpSession session) {
+        String token = (String) session.getAttribute("csrf_token");
+        if (token == null) {
+            byte[] random = new byte[32];
+            new SecureRandom().nextBytes(random);
+            token = Base64.getEncoder().encodeToString(random);
+            session.setAttribute("csrf_token", token);
+        }
+        return token;
+    }
+
+    private void validateCsrfToken(String token, HttpSession session) {
+        if (!Objects.equals(token, session.getAttribute("csrf_token"))) {
+            logger.error("CSRF token validation failed");
+            throw new IllegalArgumentException("Invalid CSRF token");
+        }
+    }
+
+    // Rate limiting with Redis
+    private void checkRateLimit(String key) {
+        String redisKey = "rate_limit:" + key;
+        Long count = redisTemplate.opsForValue().increment(redisKey);
+        if (count == 1) {
+            redisTemplate.expire(redisKey, 60, TimeUnit.SECONDS);
+        }
+        if (count > 10) {
+            logger.error("Rate limit exceeded for key: {}", key);
+            throw new IllegalStateException("Rate limit exceeded");
+        }
+    }
+
+    // Input validation
+    private String validateInput(PaymentInput input) {
+        if (input.getAmount() <= 0) {
+            logger.error("Invalid amount: {}", input.getAmount());
+            return "Amount must be positive";
+        }
+        if (!Arrays.asList("USD", "EUR", "GBP", "AUD", "CAD").contains(input.getCurrency().toUpperCase())) {
+            logger.error("Invalid currency: {}", input.getCurrency());
+            return "Invalid currency code";
+        }
+        if (!input.getReturnUrl().matches("https?://.+") || !input.getCancelUrl().matches("https?://.+")) {
+            logger.error("Invalid URLs: return={}, cancel={}", input.getReturnUrl(), input.getCancelUrl());
+            return "Invalid URLs";
+        }
+        if (Arrays.asList("EU", "UK").contains(input.getUserRegion()) && input.getCurrency().equalsIgnoreCase("EUR")) {
+            session.setAttribute("sca_required", true);
+        }
+        return null;
+    }
+
+    private String validateOrderInput(GetOrderInput input) {
+        if (input.getOrderId() == null || input.getOrderId().isEmpty()) {
+            logger.error("Invalid order ID");
+            return "Order ID is required";
+        }
+        if (!Arrays.asList("live", "sandbox").contains(input.getEnvironment())) {
+            logger.error("Invalid environment: {}", input.getEnvironment());
+            return "Invalid environment";
+        }
+        return null;
+    }
+
+    private String validateOrderInput(AuthorizeOrderInput input) {
+        if (input.getOrderId() == null || input.getOrderId().isEmpty()) {
+            logger.error("Invalid order ID");
+            return "Order ID is required";
+        }
+        if (!Arrays.asList("live", "sandbox").contains(input.getEnvironment())) {
+            logger.error("Invalid environment: {}", input.getEnvironment());
+            return "Invalid environment";
+        }
+        return null;
+    }
+
+    private String validateAuthorizedPaymentInput(GetAuthorizedPaymentInput input) {
+        if (input.getAuthorizationId() == null || input.getAuthorizationId().isEmpty()) {
+            logger.error("Invalid authorization ID");
+            return "Authorization ID is required";
+        }
+        if (!Arrays.asList("live", "sandbox").contains(input.getEnvironment())) {
+            logger.error("Invalid environment: {}", input.getEnvironment());
+            return "Invalid environment";
+        }
+        return null;
+    }
+
+    private String validateCaptureInput(CaptureAuthorizedPaymentInput input) {
+        if (input.getAuthorizationId() == null || input.getAuthorizationId().isEmpty()) {
+            logger.error("Invalid authorization ID");
+            return "Authorization ID is required";
+        }
+        if (!Arrays.asList("live", "sandbox").contains(input.getEnvironment())) {
+            logger.error("Invalid environment: {}", input.getEnvironment());
+            return "Invalid environment";
+        }
+        if (input.getAmount() != null && input.getAmount() <= 0) {
+            logger.error("Invalid capture amount: {}", input.getAmount());
+            return "Capture amount must be positive";
+        }
+        if (input.getAmount() != null && (input.getCurrency() == null || !Arrays.asList("USD", "EUR", "GBP", "AUD", "CAD").contains(input.getCurrency().toUpperCase()))) {
+            logger.error("Invalid capture currency: {}", input.getCurrency());
+            return "Invalid capture currency code";
+        }
+        return null;
+    }
+
+    // MCP AI fraud detection
+    private double checkFraudWithMCP(String mcpServerUrl, Order order, String userRegion, String ip, String userAgent) {
+        logger.info("MCP fraud check for order: {}, region: {}", order.getId(), userRegion);
+        return Math.random(); // Simulated score
+    }
+
+    // Tokenize payment
+    private CompletableFuture<String> tokenizePaymentAsync(PaypalServerSdkClient client, String orderId) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                Map<String, Object> requestBody = Map.of("payment_source", Map.of("card", Map.of()));
+                ApiResponse<?> response = client.executePost("/v2/vault/payment-tokens", requestBody);
+                if (response.getStatusCode() >= 400) {
+                    logger.error("Tokenization failed: HTTP {}", response.getStatusCode());
+                    return null;
+                }
+                Map<String, Object> result = (Map<String, Object>) response.getBody();
+                String tokenId = (String) result.get("id");
+                logger.info("Tokenized payment for order ID: {}", orderId);
+                return tokenId;
+            } catch (Exception e) {
+                logger.error("Tokenization failed for order ID {}: {}", orderId, e.getMessage());
+                throw new RuntimeException("Tokenization failed", e);
+            }
+        });
+    }
+
+    // Create PayPal order
+    private CompletableFuture<Map<String, Object>> createPayPalOrder(PaypalServerSdkClient client, OrdersController ordersController, PaymentInput input, HttpSession session, String env) {
+        String validationError = validateInput(input);
+        if (validationError != null && !validationError.equals("Invalid URLs")) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException(validationError));
+        }
+
+        CreateOrderInput createOrderInput = new CreateOrderInput.Builder(
+                null,
+                new OrderRequest.Builder(
+                        input.isAuthorize() ? CheckoutPaymentIntent.AUTHORIZE : CheckoutPaymentIntent.CAPTURE,
+                        Arrays.asList(
+                                new PurchaseUnitRequest.Builder(
+                                        new AmountWithBreakdown.Builder(
+                                                input.getCurrency().toUpperCase(),
+                                                String.format("%.2f", input.getAmount())
+                                        )
+                                        .build()
+                                )
+                                .build()
+                        )
+                )
+                .build()
+        )
+                .prefer("return=minimal")
+                .build();
+
+        if (session.getAttribute("sca_required") != null) {
+            createOrderInput.getOrderRequest().setPaymentSource(
+                    Map.of("card", Map.of(
+                            "attributes", Map.of(
+                                    "verification", Map.of("method", "SCA_ALWAYS")
+                            )
+                    ))
+            );
+        }
+
+        return ordersController.createOrderAsync(createOrderInput)
+                .thenApply(response -> {
+                    if (response.getStatusCode() >= 400) {
+                        logger.error("Order creation failed: HTTP {}", response.getStatusCode());
+                        throw new RuntimeException("Failed to create order: HTTP " + response.getStatusCode());
+                    }
+                    Order order = response.getBody();
+                    String orderId = order.getId();
+                    if (orderId == null) {
+                        logger.error("Order ID not found in response");
+                        throw new RuntimeException("Invalid order creation response");
+                    }
+
+                    String mcpServerUrl = input.isMcpAi() ? decrypt(env.equals("live") ? liveMcpServerUrl : sandboxMcpServerUrl) : null;
+                    Double fraudScore = mcpServerUrl != null ? checkFraudWithMCP(mcpServerUrl, order, input.getUserRegion(), input.getIp(), input.getUserAgent()) : null;
+                    if (fraudScore != null && fraudScore > 0.8) {
+                        logger.error("Transaction flagged as high risk: {}", fraudScore);
+                        throw new RuntimeException("Transaction flagged as high risk by MCP AI");
+                    }
+
+                    logger.info("Created order ID: {} (SCA: {}, Fraud Score: {}, Intent: {})", orderId,
+                            session.getAttribute("sca_required") != null ? "Required" : "N/A",
+                            fraudScore, input.isAuthorize() ? "AUTHORIZE" : "CAPTURE");
+                    session.setAttribute("fraud_score", fraudScore);
+                    return Map.of("id", orderId, "status", order.getStatus());
+                });
+    }
+
+    // Capture order
+    private CompletableFuture<Map<String, Object>> capturePayPalOrder(PaypalServerSdkClient client, String orderId, PaymentInput input, String env, HttpSession session) {
+        if (orderId == null || orderId.isEmpty()) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException("Order ID is required"));
+        }
+
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                ApiResponse<?> response = client.executePost("/v2/checkout/orders/" + orderId + "/capture", new HashMap<>());
+                if (response.getStatusCode() >= 400) {
+                    logger.error("Order capture failed: HTTP {}", response.getStatusCode());
+                    throw new IOException("Failed to capture order: HTTP " + response.getStatusCode());
+                }
+                return (Map<String, Object>) response.getBody();
+            } catch (Exception e) {
+                logger.error("Order capture failed for order ID {}: {}", orderId, e.getMessage());
+                throw new RuntimeException("Order capture failed", e);
+            }
+        }).thenCompose(order -> {
+            String status = (String) order.get("status");
+            if ("COMPLETED".equals(status)) {
+                return tokenizePaymentAsync(client, orderId).thenApply(tokenizedPayment -> {
+                    boolean scaVerified = session.getAttribute("sca_required") != null &&
+                            ((Map<String, Object>) ((Map<String, Object>) ((List) order.get("purchase_units")).get(0))
+                                    .get("payments")).get("authentication_result") != null;
+                    Double fraudScore = (Double) session.getAttribute("fraud_score");
+
+                    Transaction transaction = new Transaction();
+                    transaction.setOrderId(orderId);
+                    transaction.setAmount(input.getAmount());
+                    transaction.setCurrency(input.getCurrency());
+                    transaction.setStatus(status);
+                    transaction.setEnvironment(env);
+                    transaction.setScaVerified(scaVerified);
+                    transaction.setFraudScore(fraudScore);
+                    transaction.setTokenizedPayment(tokenizedPayment);
+                    transactionRepository.save(transaction);
+
+                    logger.info("Stored transaction for order ID: {} (SCA: {}, Tokenized: {})", orderId, scaVerified ? "Verified" : "Failed", tokenizedPayment != null ? "Yes" : "No");
+                    if (!scaVerified && session.getAttribute("sca_required") != null) {
+                        sendAlert("SCA verification failed for order " + orderId, "Failed");
+                    }
+                    return order;
+                });
+            }
+            logger.info("Captured order ID: {}", orderId);
+            return CompletableFuture.completedFuture(order);
+        });
+    }
+
+    // Get order
+    private CompletableFuture<Map<String, Object>> getPayPalOrder(OrdersController ordersController, GetOrderInput input, HttpSession session) {
+        String validationError = validateOrderInput(input);
+        if (validationError != null) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException(validationError));
+        }
+
+        return ordersController.getOrderAsync(input)
+                .thenApply(response -> {
+                    Order order = response.getBody();
+                    logger.info("Retrieved order ID: {} with status: {}", order.getId(), order.getStatus());
+                    return Map.of(
+                            "id", order.getId(),
+                            "status", order.getStatus(),
+                            "amount", order.getPurchaseUnits().get(0).getAmount().getValue(),
+                            "currency", order.getPurchaseUnits().get(0).getAmount().getCurrencyCode()
+                    );
+                });
+    }
+
+    // Authorize order
+    private CompletableFuture<Map<String, Object>> authorizePayPalOrder(OrdersController ordersController, AuthorizeOrderInput input, HttpSession session) {
+        String validationError = validateOrderInput(input);
+        if (validationError != null) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException(validationError));
+        }
+
+        return ordersController.authorizeOrderAsync(input)
+                .thenAccept(result -> {
+                    OrderAuthorizeResponse authResponse = result.getBody();
+                    String orderId = authResponse.getId();
+                    String status = authResponse.getStatus();
+                    logger.info("Authorization successful for order ID: {} with status: {}", orderId, status);
+
+                    Transaction transaction = new Transaction();
+                    transaction.setOrderId(orderId);
+                    transaction.setAuthorizationId(authResponse.getAuthorizationId());
+                    transaction.setAmount(Double.parseDouble(authResponse.getPurchaseUnits().get(0).getAmount().getValue()));
+                    transaction.setCurrency(authResponse.getPurchaseUnits().get(0).getAmount().getCurrencyCode());
+                    transaction.setStatus(status);
+                    transaction.setEnvironment(input.getEnvironment());
+                    transaction.setScaVerified(session.getAttribute("sca_required") != null &&
+                            authResponse.getAuthenticationResult() != null);
+                    transaction.setFraudScore((Double) session.getAttribute("fraud_score"));
+                    transactionRepository.save(transaction);
+
+                    logger.info("Stored authorization transaction for order ID: {} (SCA: {})", orderId,
+                            transaction.isScaVerified() ? "Verified" : "Failed");
+                    if (!transaction.isScaVerified() && session.getAttribute("sca_required") != null) {
+                        sendAlert("SCA verification failed for order " + orderId, "Failed");
+                    }
+                })
+                .thenApply(v -> {
+                    OrderAuthorizeResponse authResponse = ordersController.authorizeOrderAsync(input).join().getBody();
+                    return Map.of(
+                            "id", authResponse.getId(),
+                            "status", authResponse.getStatus(),
+                            "amount", authResponse.getPurchaseUnits().get(0).getAmount().getValue(),
+                            "currency", authResponse.getPurchaseUnits().get(0).getAmount().getCurrencyCode(),
+                            "authorizationId", authResponse.getAuthorizationId() != null ? authResponse.getAuthorizationId() : ""
+                    );
+                })
+                .exceptionally(exception -> {
+                    logger.error("Authorization failed for order ID {}: {}", input.getOrderId(), exception.getMessage());
+                    sendAlert("Authorization failed for order " + input.getOrderId() + ": " + exception.getMessage(), "Error");
+                    throw new RuntimeException("Authorization failed", exception);
+                });
+    }
+
+    // Get authorized payment
+    private CompletableFuture<Map<String, Object>> getAuthorizedPayment(OrdersController ordersController, GetAuthorizedPaymentInput input, HttpSession session) {
+        String validationError = validateAuthorizedPaymentInput(input);
+        if (validationError != null) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException(validationError));
+        }
+
+        return ordersController.getAuthorizedPaymentAsync(input)
+                .thenApply(response -> {
+                    PaymentAuthorization auth = response.getBody();
+                    String authorizationId = auth.getId();
+                    String status = auth.getStatus();
+                    logger.info("Retrieved authorization ID: {} with status: {}", authorizationId, status);
+
+                    Transaction transaction = new Transaction();
+                    transaction.setAuthorizationId(authorizationId);
+                    transaction.setOrderId(auth.getOrderId());
+                    transaction.setAmount(Double.parseDouble(auth.getAmount().getValue()));
+                    transaction.setCurrency(auth.getAmount().getCurrencyCode());
+                    transaction.setStatus(status);
+                    transaction.setEnvironment(input.getEnvironment());
+                    transaction.setScaVerified(session.getAttribute("sca_required") != null &&
+                            auth.getAuthenticationResult() != null);
+                    transaction.setFraudScore((Double) session.getAttribute("fraud_score"));
+                    transactionRepository.save(transaction);
+
+                    logger.info("Stored authorization transaction for authorization ID: {} (SCA: {})", authorizationId,
+                            transaction.isScaVerified() ? "Verified" : "Failed");
+                    if (!transaction.isScaVerified() && session.getAttribute("sca_required") != null) {
+                        sendAlert("SCA verification failed for authorization " + authorizationId, "Failed");
+                    }
+
+                    return Map.of(
+                            "id", authorizationId,
+                            "orderId", auth.getOrderId() != null ? auth.getOrderId() : "",
+                            "status", status,
+                            "amount", auth.getAmount().getValue(),
+                            "currency", auth.getAmount().getCurrencyCode()
+                    );
+                })
+                .exceptionally(exception -> {
+                    logger.error("Authorization retrieval failed for authorization ID {}: {}", input.getAuthorizationId(), exception.getMessage());
+                    sendAlert("Authorization retrieval failed: " + exception.getMessage(), "Error");
+                    throw new RuntimeException("Authorization retrieval failed", exception);
+                });
+    }
+
+    // Capture authorized payment
+    private CompletableFuture<Map<String, Object>> captureAuthorizedPayment(PaypalServerSdkClient client, OrdersController ordersController, CaptureAuthorizedPaymentInput input, HttpSession session) {
+        String validationError = validateCaptureInput(input);
+        if (validationError != null) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException(validationError));
+        }
+
+        return ordersController.captureAuthorizedPaymentAsync(input)
+                .thenCompose(response -> {
+                    CapturedPayment captured = response.getBody();
+                    String captureId = captured.getId();
+                    String status = captured.getStatus();
+                    logger.info("Captured authorization ID: {} with status: {}", input.getAuthorizationId(), status);
+
+                    return tokenizePaymentAsync(client, input.getAuthorizationId()).thenApply(tokenizedPayment -> {
+                        Transaction transaction = new Transaction();
+                        transaction.setAuthorizationId(input.getAuthorizationId());
+                        transaction.setCaptureId(captureId);
+                        transaction.setOrderId(captured.getOrderId());
+                        transaction.setAmount(input.getAmount() != null ? input.getAmount() : Double.parseDouble(captured.getAmount().getValue()));
+                        transaction.setCurrency(input.getCurrency() != null ? input.getCurrency() : captured.getAmount().getCurrencyCode());
+                        transaction.setStatus(status);
+                        transaction.setEnvironment(input.getEnvironment());
+                        transaction.setScaVerified(session.getAttribute("sca_required") != null &&
+                                captured.getAuthenticationResult() != null);
+                        transaction.setFraudScore((Double) session.getAttribute("fraud_score"));
+                        transaction.setTokenizedPayment(tokenizedPayment);
+                        transactionRepository.save(transaction);
+
+                        logger.info("Stored capture transaction for capture ID: {} (SCA: {}, Tokenized: {})", captureId,
+                                transaction.isScaVerified() ? "Verified" : "Failed", tokenizedPayment != null ? "Yes" : "No");
+                        if (!transaction.isScaVerified() && session.getAttribute("sca_required") != null) {
+                            sendAlert("SCA verification failed for capture " + captureId, "Failed");
+                        }
+
+                        return Map.of(
+                                "id", captureId,
+                                "orderId", captured.getOrderId() != null ? captured.getOrderId() : "",
+                                "authorizationId", input.getAuthorizationId(),
+                                "status", status,
+                                "amount", captured.getAmount().getValue(),
+                                "currency", captured.getAmount().getCurrencyCode()
+                        );
+                    });
+                })
+                .exceptionally(exception -> {
+                    logger.error("Capture failed for authorization ID {}: {}", input.getAuthorizationId(), exception.getMessage());
+                    sendAlert("Capture failed for authorization ID " + input.getAuthorizationId() + ": " + exception.getMessage(), "Error");
+                    throw new RuntimeException("Capture failed", exception);
+                });
+    }
+
+    // Generate transaction chart
+    @GetMapping(value = "/transaction-chart", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> getTransactionChart(
+            @RequestParam String csrfToken,
+            @RequestParam(defaultValue = "live") String env,
+            HttpSession session
+    ) {
+        validateCsrfToken(csrfToken, session);
+        String rateLimitKey = "transaction_chart:" + request.getRemoteAddr() + ":" + request.getHeader("User-Agent");
+        checkRateLimit(rateLimitKey);
+
+        try {
+            // Fetch transaction counts by status
+            List<Object[]> statusCounts = transactionRepository.countTransactionsByStatus();
+            Map<String, Long> countsByStatus = new HashMap<>();
+            for (Object[] result : statusCounts) {
+                String status = (String) result[0];
+                Long count = (Long) result[1];
+                countsByStatus.put(status, count);
+            }
+
+            // Define transaction statuses
+            List<String> statuses = Arrays.asList("CREATED", "AUTHORIZED", "CAPTURED", "COMPLETED");
+            List<Map<String, Object>> datasets = new ArrayList<>();
+            int index = 0;
+
+            for (String status : statuses) {
+                long count = countsByStatus.getOrDefault(status, 0L);
+                // Assign coordinates and radius based on count
+                double x = index * 10 + 10; // Spread points along x-axis
+                double y = count * 5; // Scale y-axis by count
+                double radius = Math.min(10 + count * 2, 30); // Cap radius at 30
+                String color = switch (index) {
+                    case 0 -> "rgba(54, 162, 235, 0.7)"; // Blue for CREATED
+                    case 1 -> "rgba(255, 206, 86, 0.7)"; // Yellow for AUTHORIZED
+                    case 2 -> "rgba(75, 192, 192, 0.7)"; // Teal for CAPTURED
+                    case 3 -> "rgba(153, 102, 255, 0.7)"; // Purple for COMPLETED
+                    default -> "rgba(0, 0, 0, 0.7)";
+                };
+
+                datasets.add(Map.of(
+                        "label", status,
+                        "data", List.of(Map.of("x", x, "y", y, "r", radius)),
+                        "backgroundColor", color,
+                        "borderColor", color.replace("0.7", "1.0"),
+                        "borderWidth", 1
+                ));
+                index++;
+            }
+
+            // Chart.js configuration
+            String chartConfig = """
+                {
+                    "type": "scatter",
+                    "data": {
+                        "datasets": %s
+                    },
+                    "options": {
+                        "scales": {
+                            "x": {
+                                "type": "linear",
+                                "position": "bottom",
+                                "title": {
+                                    "display": true,
+                                    "text": "Transaction Stage"
+                                },
+                                "ticks": {
+                                    "callback": function(value, index, values) {
+                                        const labels = ["CREATED", "AUTHORIZED", "CAPTURED", "COMPLETED"];
+                                        return labels[Math.floor(value / 10)];
+                                    }
+                                }
+                            },
+                            "y": {
+                                "title": {
+                                    "display": true,
+                                    "text": "Transaction Amount (Scaled)"
+                                }
+                            }
+                        },
+                        "plugins": {
+                            "legend": {
+                                "display": true
+                            },
+                            "tooltip": {
+                                "callbacks": {
+                                    "label": function(context) {
+                                        return context.dataset.label + ": " + context.raw.r / 2 + " transactions";
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                """.formatted(datasets);
+            logger.info("Generated transaction chart for env: {}", env);
+            return ResponseEntity.ok().body(datasets); // Chart.js config is rendered as a chart
+        } catch (Exception e) {
+            logger.error("Failed to generate transaction chart: {}", e.getMessage());
+            sendAlert("Failed to generate transaction chart: " + e.getMessage(), "Error");
+            return ResponseEntity.badRequest().body("Failed to generate chart: " + e.getMessage());
+        }
+    }
+
+    // Generate circles diagram
+    @GetMapping("/circles-diagram")
+    public String generateCirclesDiagram(
+            @RequestParam String csrfToken,
+            HttpSession session
+    ) {
+        validateCsrfToken(csrfToken, session);
+        String rateLimitKey = "circles_diagram:" + request.getRemoteAddr() + ":" + request.getHeader("User-Agent");
+        checkRateLimit(rateLimitKey);
+
+        logger.info("Generating 4 circles diagram");
+        return """
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>PayPal Developer Circles Diagram</title>
+                    <style>
+                        body {
+                            font-family: Arial, sans-serif;
+                            display: flex;
+                            justify-content: center;
+                            align-items: center;
+                            height: 100vh;
+                            margin: 0;
+                            background-color: #f0f0f0;
+                        }
+                        #diagram {
+                            display: flex;
+                            justify-content: center;
+                        }
+                        svg {
+                            border: 1px solid #ccc;
+                            background-color: white;
+                            max-width: 100%;
+                            height: auto;
+                        }
+                        text {
+                            font-size: 14px;
+                            fill: #333;
+                            text-anchor: middle;
+                            dominant-baseline: middle;
+                        }
+                    </style>
+                </head>
+                <body>
+                    <div id="diagram"></div>
+                    <script>
+                        function generateCircleDiagram() {
+                            const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+                            svg.setAttribute('width', '600');
+                            svg.setAttribute('height', '600');
+                            svg.setAttribute('viewBox', '0 0 600 600');
+                            document.getElementById('diagram').appendChild(svg);
+
+                            const centerX = 300;
+                            const centerY = 300;
+                            const radii = [50, 120, 200, 280]; // Sean Lewis, Developer, Sandbox, PayPal
+                            const labels = ['Sean Lewis', 'Developer', 'Sandbox', 'PayPal'];
+                            const colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4']; // Distinct colors
+                            const bridges = 9; // 9 radial lines
+
+                            // Draw 4 concentric circles
+                            radii.forEach((radius, index) => {
+                                const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                                circle.setAttribute('cx', centerX);
+                                circle.setAttribute('cy', centerY);
+                                circle.setAttribute('r', radius);
+                                circle.setAttribute('fill', 'none');
+                                circle.setAttribute('stroke', colors[index]);
+                                circle.setAttribute('stroke-width', '3');
+                                svg.appendChild(circle);
+
+                                // Add label above each circle
+                                const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                                text.setAttribute('x', centerX);
+                                text.setAttribute('y', centerY - radius - 15);
+                                text.textContent = labels[index];
+                                svg.appendChild(text);
+                            });
+
+                            // Draw 9 radial bridges (lines) spaced 40 degrees apart
+                            for (let i = 0; i < bridges; i++) {
+                                const angle = (i * 360 / bridges) * (Math.PI / 180); // Convert to radians
+                                const x2 = centerX + radii[3] * Math.cos(angle); // End at PayPal circle
+                                const y2 = centerY + radii[3] * Math.sin(angle);
+                                const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                                line.setAttribute('x1', centerX);
+                                line.setAttribute('y1', centerY);
+                                line.setAttribute('x2', x2);
+                                line.setAttribute('y2', y2);
+                                line.setAttribute('stroke', '#666');
+                                line.setAttribute('stroke-width', '2');
+                                line.setAttribute('stroke-dasharray', '5,5'); // Dashed for clarity
+                                svg.appendChild(line);
+                            }
+
+                            // Add bridge labels (PayPal developer features)
+                            const bridgeLabels = [
+                                'API Integration', 'Tokenization', 'Async Ops',
+                                'CSRF Protection', 'Rate Limiting', 'SCA/3DS',
+                                'Fraud Detection', 'Webhooks', 'Monitoring'
+                            ];
+                            for (let i = 0; i < bridges; i++) {
+                                const angle = (i * 360 / bridges) * (Math.PI / 180);
+                                const labelRadius = radii[3] + 20; // Outside PayPal circle
+                                const x = centerX + labelRadius * Math.cos(angle);
+                                const y = centerY + labelRadius * Math.sin(angle);
+                                const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                                text.setAttribute('x', x);
+                                text.setAttribute('y', y);
+                                text.setAttribute('transform', `rotate(${i * 360 / bridges}, ${x}, ${y})`);
+                                text.textContent = bridgeLabels[i];
+                                text.setAttribute('font-size', '12');
+                                svg.appendChild(text);
+                            }
+                        }
+
+                        // Generate the diagram on page load
+                        generateCircleDiagram();
+                    </script>
+                </body>
+                </html>
+                """;
+    }
+
+    // Bean definitions
+    @Bean
+    public OrdersController liveOrdersController() {
+        return new OrdersController(liveClient);
+    }
+
+    @Bean
+    public OrdersController sandboxOrdersController() {
+        return new OrdersController(sandboxClient);
+    }
+
+    // Endpoints
+    @GetMapping("/sandbox-button")
+    public String sandboxButton(
+            @RequestParam(defaultValue = "10.00") double amount,
+            @RequestParam(defaultValue = "USD") String currency,
+            @RequestParam(defaultValue = "https://yourdomain.com/success") String returnUrl,
+            @RequestParam(defaultValue = "https://yourdomain.com/cancel") String cancelUrl,
+            @RequestParam String csrfToken,
+            @RequestParam(defaultValue = "US") String region,
+            @RequestParam(defaultValue = "false") boolean mcpAi,
+            @RequestParam(defaultValue = "false") boolean authorize,
+            HttpSession session
+    ) {
+        validateCsrfToken(csrfToken, session);
+        String rateLimitKey = "payment:" + request.getRemoteAddr() + ":" + request.getHeader("User-Agent");
+        checkRateLimit(rateLimitKey);
+
+        PaymentInput input = new PaymentInput(amount, currency, returnUrl, cancelUrl, region, mcpAi,
+                request.getRemoteAddr(), request.getHeader("User-Agent"), authorize);
+        String validationError = validateInput(input);
+        if (validationError != null) {
+            return "<div style='color: red; font-weight: bold;'>Error: " + validationError + "</div>";
+        }
+
+        logger.info("Rendering PayPal Checkout SDK button for amount: {} {}, intent: {}", amount, currency,
+                authorize ? "authorize" : "capture");
+        return """
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <title>PayPal Sandbox Payment</title>
+                </head>
+                <body>
+                    <div id="paypal-button-container"></div>
+                    <script src="https://www.paypal.com/sdk/js?client-id=%s&currency=%s&components=buttons,hosted-fields"></script>
+                    <script>
+                        paypal.Buttons({
+                            createOrder: function(data, actions) {
+                                return actions.order.create({
+                                    purchase_units: [{
+                                        amount: {
+                                            value: '%s',
+                                            currency_code: '%s'
+                                        }
+                                    }],
+                                    application_context: {
+                                        shipping_preference: 'NO_SHIPPING'
+                                    },
+                                    intent: '%s',
+                                    payment_source: {
+                                        card: {
+                                            attributes: {
+                                                verification: {
+                                                    method: '%s'
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
+                            },
+                            onApprove: function(data, actions) {
+                                return actions.order.%s().then(function(details) {
+                                    window.location.href = '%s?orderID=' + data.orderID;
+                                });
+                            },
+                            onCancel: function(data) {
+                                window.location.href = '%s';
+                            },
+                            onError: function(err) {
+                                console.error('PayPal error:', err);
+                                alert('An error occurred during payment. Please try again.');
+                            }
+                        }).render('#paypal-button-container');
+                    </script>
+                    %s
+                </body>
+                </html>
+                """.formatted(
+                decrypt(sandboxClientId),
+                currency,
+                String.format("%.2f", amount),
+                currency,
+                authorize ? "authorize" : "capture",
+                session.getAttribute("sca_required") != null ? "SCA_ALWAYS" : "SCA_WHEN_REQUIRED",
+                authorize ? "authorize" : "capture",
+                returnUrl,
+                cancelUrl,
+                session.getAttribute("sca_required") != null ? "<script>alert('SCA required');</script>" : ""
+        );
+    }
+
+    @GetMapping("/trigger-payment")
+    public CompletableFuture<ResponseEntity<?>> triggerPayment(
+            @RequestParam(defaultValue = "10.00") double amount,
+            @RequestParam(defaultValue = "USD") String currency,
+            @RequestParam(defaultValue = "https://yourdomain.com/success") String returnUrl,
+            @RequestParam(defaultValue = "https://yourdomain.com/cancel") String cancelUrl,
+            @RequestParam String csrfToken,
+            @RequestParam(defaultValue = "US") String region,
+            @RequestParam(defaultValue = "false") boolean mcpAi,
+            @RequestParam(defaultValue = "false") boolean authorize,
+            HttpSession session,
+            @Autowired OrdersController liveOrdersController
+    ) {
+        validateCsrfToken(csrfToken, session);
+        String rateLimitKey = "payment:" + request.getRemoteAddr() + ":" + request.getHeader("User-Agent");
+        checkRateLimit(rateLimitKey);
+
+        PaymentInput input = new PaymentInput(amount, currency, returnUrl, cancelUrl, region, mcpAi,
+                request.getRemoteAddr(), request.getHeader("User-Agent"), authorize);
+        String validationError = validateInput(input);
+        if (validationError != null && !validationError.equals("Invalid URLs")) {
+            return CompletableFuture.completedFuture(ResponseEntity.badRequest().body(validationError));
+        }
+
+        return createPayPalOrder(liveClient, liveOrdersController, input, session, "live")
+                .thenCompose(order -> {
+                    if (input.isAuthorize()) {
+                        AuthorizeOrderInput authInput = new AuthorizeOrderInput.Builder((String) order.get("id"), "live")
+                                .prefer("return=minimal")
+                                .build();
+                        return authorizePayPalOrder(liveOrdersController, authInput, session);
+                    } else {
+                        return capturePayPalOrder(liveClient, (String) order.get("id"), input, "live", session);
+                    }
+                })
+                .thenApply(order -> ResponseEntity.ok(Map.of("orderId", order.get("id"), "status", order.get("status"))))
+                .exceptionally(e -> {
+                    logger.error("Live payment/authorization failed: {}", e.getMessage());
+                    sendAlert("Live payment/authorization failed: " + e.getMessage(), "Error");
+                    return ResponseEntity.badRequest().body(e.getMessage());
+                });
+    }
+
+    @GetMapping("/get-order")
+    public CompletableFuture<ResponseEntity<?>> getOrder(
+            @RequestParam String orderId,
+            @RequestParam String csrfToken,
+            @RequestParam(defaultValue = "live") String env,
+            HttpSession session,
+            @Autowired OrdersController liveOrdersController,
+            @Autowired OrdersController sandboxOrdersController
+    ) {
+        validateCsrfToken(csrfToken, session);
+        String rateLimitKey = "get_order:" + request.getRemoteAddr() + ":" + request.getHeader("User-Agent");
+        checkRateLimit(rateLimitKey);
+
+        GetOrderInput input = new GetOrderInput(orderId, env);
+        String validationError = validateOrderInput(input);
+        if (validationError != null) {
+            return CompletableFuture.completedFuture(ResponseEntity.badRequest().body(validationError));
+        }
+
+        OrdersController ordersController = env.equals("live") ? liveOrdersController : sandboxOrdersController;
+        return getPayPalOrder(ordersController, input, session)
+                .thenApply(order -> ResponseEntity.ok(order))
+                .exceptionally(e -> {
+                    logger.error("Order retrieval failed for order ID {}: {}", orderId, e.getMessage());
+                    sendAlert("Order retrieval failed: " + e.getMessage(), "Error");
+                    return ResponseEntity.badRequest().body(e.getMessage());
+                });
+    }
+
+    @GetMapping("/authorize-order")
+    public CompletableFuture<ResponseEntity<?>> authorizeOrder(
+            @RequestParam String orderId,
+            @RequestParam String csrfToken,
+            @RequestParam(defaultValue = "live") String env,
+            HttpSession session,
+            @Autowired OrdersController liveOrdersController,
+            @Autowired OrdersController sandboxOrdersController
+    ) {
+        validateCsrfToken(csrfToken, session);
+        String rateLimitKey = "authorize_order:" + request.getRemoteAddr() + ":" + request.getHeader("User-Agent");
+        checkRateLimit(rateLimitKey);
+
+        AuthorizeOrderInput input = new AuthorizeOrderInput.Builder(orderId, env)
+                .prefer("return=minimal")
+                .build();
+        String validationError = validateOrderInput(input);
+        if (validationError != null) {
+            return CompletableFuture.completedFuture(ResponseEntity.badRequest().body(validationError));
+        }
+
+        OrdersController ordersController = env.equals("live") ? liveOrdersController : sandboxOrdersController;
+        return authorizePayPalOrder(ordersController, input, session)
+                .thenApply(order -> ResponseEntity.ok(order))
+                .exceptionally(e -> {
+                    logger.error("Order authorization failed for order ID {}: {}", orderId, e.getMessage());
+                    sendAlert("Order authorization failed: " + e.getMessage(), "Error");
+                    return ResponseEntity.badRequest().body(e.getMessage());
+                });
+    }
+
+    @GetMapping("/get-authorized-payment")
+    public CompletableFuture<ResponseEntity<?>> getAuthorizedPayment(
+            @RequestParam String authorizationId,
+            @RequestParam String csrfToken,
+            @RequestParam(defaultValue = "live") String env,
+            HttpSession session,
+            @Autowired OrdersController liveOrdersController,
+            @Autowired OrdersController sandboxOrdersController
+    ) {
+        validateCsrfToken(csrfToken, session);
+        String rateLimitKey = "get_authorized_payment:" + request.getRemoteAddr() + ":" + request.getHeader("User-Agent");
+        checkRateLimit(rateLimitKey);
+
+        GetAuthorizedPaymentInput input = new GetAuthorizedPaymentInput(authorizationId, env);
+        String validationError = validateAuthorizedPaymentInput(input);
+        if (validationError != null) {
+            return CompletableFuture.completedFuture(ResponseEntity.badRequest().body(validationError));
+        }
+
+        OrdersController ordersController = env.equals("live") ? liveOrdersController : sandboxOrdersController;
+        return getAuthorizedPayment(ordersController, input, session)
+                .thenApply(auth -> ResponseEntity.ok(auth))
+                .exceptionally(e -> {
+                    logger.error("Authorization retrieval failed for authorization ID {}: {}", authorizationId, e.getMessage());
+                    sendAlert("Authorization retrieval failed: " + e.getMessage(), "Error");
+                    return ResponseEntity.badRequest().body(e.getMessage());
+                });
+    }
+
+    @GetMapping("/capture-authorized-payment")
+    public CompletableFuture<ResponseEntity<?>> captureAuthorizedPayment(
+            @RequestParam String authorizationId,
+            @RequestParam String csrfToken,
+            @RequestParam(defaultValue = "live") String env,
+            @RequestParam(required = false) Double amount,
+            @RequestParam(required = false) String currency,
+            HttpSession session,
+            @Autowired OrdersController liveOrdersController,
+            @Autowired OrdersController sandboxOrdersController
+    ) {
+        validateCsrfToken(csrfToken, session);
+        String rateLimitKey = "capture_authorized_payment:" + request.getRemoteAddr() + ":" + request.getHeader("User-Agent");
+        checkRateLimit(rateLimitKey);
+
+        CaptureAuthorizedPaymentInput input = new CaptureAuthorizedPaymentInput(authorizationId, env, amount, currency);
+        String validationError = validateCaptureInput(input);
+        if (validationError != null) {
+            return CompletableFuture.completedFuture(ResponseEntity.badRequest().body(validationError));
+        }
+
+        OrdersController ordersController = env.equals("live") ? liveOrdersController : sandboxOrdersController;
+        PaypalServerSdkClient client = env.equals("live") ? liveClient : sandboxClient;
+        return captureAuthorizedPayment(client, ordersController, input, session)
+                .thenApply(capture -> ResponseEntity.ok(capture))
+                .exceptionally(e -> {
+                    logger.error("Capture failed for authorization ID {}: {}", authorizationId, e.getMessage());
+                    sendAlert("Capture failed for authorization ID " + authorizationId + ": " + e.getMessage(), "Error");
+                    return ResponseEntity.badRequest().body(e.getMessage());
+                });
+    }
+
+    @PostMapping("/webhook")
+    public ResponseEntity<?> handleWebhook(
+            @RequestBody Map<String, Object> webhookData,
+            @RequestParam(defaultValue = "live") String env,
+            @RequestHeader Map<String, String> headers
+    ) {
+        try {
+            if (!"application/json".equals(headers.get("Content-Type"))) {
+                logger.error("Invalid webhook content type");
+                return ResponseEntity.badRequest().build();
+            }
+
+            String webhookId = env.equals("live") ? decrypt(liveWebhookId) : decrypt(sandboxWebhookId);
+            if ("PAYMENT.AUTHORIZATION.CREATED".equals(webhookData.get("event_type")) ||
+                "PAYMENT.CAPTURE.COMPLETED".equals(webhookData.get("event_type"))) {
+                String orderId = (String) ((Map) webhookData.get("resource")).get("order_id");
+                String authorizationId = webhookData.get("event_type").equals("PAYMENT.AUTHORIZATION.CREATED")
+                        ? (String) ((Map) webhookData.get("resource")).get("id")
+                        : null;
+                String captureId = webhookData.get("event_type").equals("PAYMENT.CAPTURE.COMPLETED")
+                        ? (String) ((Map) webhookData.get("resource")).get("id")
+                        : null;
+                double amount = Double.parseDouble((String) ((Map) webhookData.get("resource")).get("amount").get("value"));
+                String currency = (String) ((Map) webhookData.get("resource")).get("amount").get("currency_code");
+                boolean scaVerified = ((Map) webhookData.get("resource")).get("authentication_result") != null;
+
+                Transaction transaction = new Transaction();
+                transaction.setOrderId(orderId);
+                transaction.setAuthorizationId(authorizationId);
+                transaction.setCaptureId(captureId);
+                transaction.setAmount(amount);
+                transaction.setCurrency(currency);
+                transaction.setStatus(webhookData.get("event_type").equals("PAYMENT.AUTHORIZATION.CREATED") ? "AUTHORIZED" : "COMPLETED");
+                transaction.setEnvironment(env);
+                transaction.setScaVerified(scaVerified);
+                transactionRepository.save(transaction);
+
+                logger.info("Webhook: Payment {} for order ID: {} (SCA: {})",
+                        webhookData.get("event_type"), orderId, scaVerified ? "Verified" : "Failed");
+            }
+
+            return ResponseEntity.ok().build();
+        } catch (Exception e) {
+            logger.error("Webhook processing failed: {}", e.getMessage());
+            sendAlert("Webhook processing failed: " + e.getMessage(), "Error");
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+
+    @GetMapping(value = "/openapi-spec", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Map<String, Object> getOpenApiSpec() {
+        return Map.of(
+                "openapi", "3.0.0",
+                "info", Map.of("title", "PayPal Payment API 2025", "version", "2.0"),
+                "paths", Map.of(
+                        "/paypal/sandbox-button", Map.of(
+                                "get", Map.of(
+                                        "summary", "Renders PayPal Checkout SDK button",
+                                        "parameters", Arrays.asList(
+                                                Map.of("name", "amount", "in", "query", "schema", Map.of("type", "number")),
+                                                Map.of("name", "currency", "in", "query", "schema", Map.of("type", "string")),
+                                                Map.of("name", "return_url", "in", "query", "schema", Map.of("type", "string", "format", "uri")),
+                                                Map.of("name", "cancel_url", "in", "query", "schema", Map.of("type", "string", "format", "uri")),
+                                                Map.of("name", "csrf_token", "in", "query", "schema", Map.of("type", "string")),
+                                                Map.of("name", "region", "in", "query", "schema", Map.of("type", "string")),
+                                                Map.of("name", "mcp_ai", "in", "query", "schema", Map.of("type", "boolean")),
+                                                Map.of("name", "authorize", "in", "query", "schema", Map.of("type", "boolean"))
+                                        )
+                                )
+                        ),
+                        "/paypal/trigger-payment", Map.of(
+                                "get", Map.of(
+                                        "summary", "Triggers live PayPal payment or authorization asynchronously",
+                                        "parameters", Arrays.asList(
+                                                Map.of("name", "amount", "in", "query", "schema", Map.of("type", "number")),
+                                                Map.of("name", "currency", "in", "query", "schema", Map.of("type", "string")),
+                                                Map.of("name", "return_url", "in", "query", "schema", Map.of("type", "string", "format", "uri")),
+                                                Map.of("name", "cancel_url", "in", "query", "schema", Map.of("type", "string", "format", "uri")),
+                                                Map.of("name", "csrf_token", "in", "query", "schema", Map.of("type", "string")),
+                                                Map.of("name", "region", "in", "query", "schema", Map.of("type", "string")),
+                                                Map.of("name", "mcp_ai", "in", "query", "schema", Map.of("type", "boolean")),
+                                                Map.of("name", "authorize", "in", "query", "schema", Map.of("type", "boolean"))
+                                        )
+                                )
+                        ),
+                        "/paypal/get-order", Map.of(
+                                "get", Map.of(
+                                        "summary", "Retrieves PayPal order details asynchronously",
+                                        "parameters", Arrays.asList(
+                                                Map.of("name", "orderId", "in", "query", "schema", Map.of("type", "string")),
+                                                Map.of("name", "csrf_token", "in", "query", "schema", Map.of("type", "string")),
+                                                Map.of("name", "env", "in", "query", "schema", Map.of("type", "string", "enum", Arrays.asList("live", "sandbox")))
+                                        )
+                                )
+                        ),
+                        "/paypal/authorize-order", Map.of(
+                                "get", Map.of(
+                                        "summary", "Authorizes a PayPal order asynchronously",
+                                        "parameters", Arrays.asList(
+                                                Map.of("name", "orderId", "in", "query", "schema", Map.of("type", "string")),
+                                                Map.of("name", "csrf_token", "in", "query", "schema", Map.of("type", "string")),
+                                                Map.of("name", "env", "in", "query", "schema", Map.of("type", "string", "enum", Arrays.asList("live", "sandbox")))
+                                        )
+                                )
+                        ),
+                        "/paypal/get-authorized-payment", Map.of(
+                                "get", Map.of(
+                                        "summary", "Retrieves PayPal authorized payment details asynchronously",
+                                        "parameters", Arrays.asList(
+                                                Map.of("name", "authorizationId", "in", "query", "schema", Map.of("type", "string")),
+                                                Map.of("name", "csrf_token", "in", "query", "schema", Map.of("type", "string")),
+                                                Map.of("name", "env", "in", "query", "schema", Map.of("type", "string", "enum", Arrays.asList("live", "sandbox")))
+                                        )
+                                )
+                        ),
+                        "/paypal/capture-authorized-payment", Map.of(
+                                "get", Map.of(
+                                        "summary", "Captures an authorized PayPal payment asynchronously",
+                                        "parameters", Arrays.asList(
+                                                Map.of("name", "authorizationId", "in", "query", "schema", Map.of("type", "string")),
+                                                Map.of("name", "csrf_token", "in", "query", "schema", Map.of("type", "string")),
+                                                Map.of("name", "env", "in", "query", "schema", Map.of("type", "string", "enum", Arrays.asList("live", "sandbox"))),
+                                                Map.of("name", "amount", "in", "query", "schema", Map.of("type", "number"), "required", false),
+                                                Map.of("name", "currency", "in", "query", "schema", Map.of("type", "string"), "required", false)
+                                        )
+                                )
+                        ),
+                        "/paypal/transaction-chart", Map.of(
+                                "get", Map.of(
+                                        "summary", "Generates a scatter chart of transaction statuses",
+                                        "parameters", Arrays.asList(
+                                                Map.of("name", "csrf_token", "in", "query", "schema", Map.of("type", "string")),
+                                                Map.of("name", "env", "in", "query", "schema", Map.of("type", "string", "enum", Arrays.asList("live", "sandbox")))
+                                        )
+                                )
+                        ),
+                        "/paypal/circles-diagram", Map.of(
+                                "get", Map.of(
+                                        "summary", "Generates a diagram of 4 concentric circles with 9 bridges",
+                                        "parameters", Arrays.asList(
+                                                Map.of("name", "csrf_token", "in", "query", "schema", Map.of("type", "string"))
+                                        )
+                                )
+                        ),
+                        "/paypal/webhook", Map.of(
+                                "post", Map.of(
+                                        "summary", "Handles PayPal webhooks",
+                                        "parameters", Arrays.asList(
+                                                Map.of("name", "env", "in", "query", "schema", Map.of("type", "string", "enum", Arrays.asList("live", "sandbox")))
+                                        )
+                                )
+                        )
+                )
+        );
+    }
+
+    private void sendAlert(String message, String context) {
+        logger.warn("Alert: {} (Context: {})", message, context);
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(PayPalPaymentApplication.class, args);
+    }
+}
